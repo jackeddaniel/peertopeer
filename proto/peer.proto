@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+option go_package = "./";
+
+package proto;
+
+message req {
+    string key = 1;
+    string val = 2;
+}
+
+message res {
+    string content = 1;
+}
+
+service Node {
+    rpc put_req(req) returns (res){}
+}

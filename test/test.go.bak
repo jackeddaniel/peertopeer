@@ -1,0 +1,193 @@
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net"
+    "net/http"
+    "os"
+    "sync"
+
+    pb "peertopeer/test/test_proto"
+
+    "google.golang.org/grpc"
+)
+
+type node struct {
+    id       string
+    port     string
+    nodelist map[string]string
+}
+
+var thisnode node
+var leaderID string
+
+// gRPC server struct
+type networkServer struct {
+    pb.UnimplementedNetworkServer
+    kvStore map[string]string
+    mu      sync.RWMutex
+}
+
+// --- RPC Implementations ---
+
+// JoinNetwork: a new node joins and gets the list of known nodes
+func (s *networkServer) JoinNetwork(ctx context.Context, req *pb.Node) (*pb.SeedResponse, error) {
+    incomingID := req.Id
+    incomingAddr := req.Address
+    log.Printf("Received Join request from: %v (%v)", incomingID, incomingAddr)
+
+    // Add to our nodelist
+    thisnode.nodelist[incomingID] = incomingAddr
+
+    response := &pb.SeedResponse{
+        Nodelist:       thisnode.nodelist,
+        Acknowledgement: "Successfully joined the network.",
+    }
+    return response, nil
+}
+
+// Put: only leader accepts writes and replicates
+func (s *networkServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+    if thisnode.id != leaderID {
+        return &pb.PutResponse{
+            Success: false,
+            Message: "Writes are only allowed at the leader",
+        }, nil
+    }
+
+    key := req.Key
+    value := req.Value
+
+    s.mu.Lock()
+    s.kvStore[key] = value
+    s.mu.Unlock()
+
+    log.Printf("[Leader] Stored key=%s value=%s", key, value)
+
+    // Replicate to all peers
+    for peerID, peerAddr := range thisnode.nodelist {
+        if peerID == thisnode.id {
+            continue // skip self
+        }
+        conn, err := grpc.Dial(peerAddr, grpc.WithInsecure())
+        if err != nil {
+            log.Printf("Failed to connect to peer %s: %v", peerID, err)
+            continue
+        }
+        client := pb.NewNetworkClient(conn)
+        _, err = client.Replicate(context.Background(), &pb.ReplicateRequest{Key: key, Value: value})
+        if err != nil {
+            log.Printf("Replication to %s failed: %v", peerID, err)
+        }
+        conn.Close()
+    }
+
+    return &pb.PutResponse{
+        Success: true,
+        Message: fmt.Sprintf("Key %s replicated successfully", key),
+    }, nil
+}
+
+// Get: can be served by any node
+func (s *networkServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    value, ok := s.kvStore[req.Key]
+    if !ok {
+        return &pb.GetResponse{Found: false}, nil
+    }
+    return &pb.GetResponse{Value: value, Found: true}, nil
+}
+
+// Replicate: followers accept updates from leader
+func (s *networkServer) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
+    s.mu.Lock()
+    s.kvStore[req.Key] = req.Value
+    s.mu.Unlock()
+
+    log.Printf("[Follower] Replicated key=%s value=%s", req.Key, req.Value)
+
+    return &pb.ReplicateResponse{Success: true}, nil
+}
+
+// --- gRPC Server Startup ---
+
+func runGRPCServer(s *networkServer) error {
+    lis, err := net.Listen("tcp", ":"+thisnode.port)
+    if err != nil {
+        return fmt.Errorf("failed to listen: %v", err)
+    }
+
+    grpcServer := grpc.NewServer()
+    pb.RegisterNetworkServer(grpcServer, s)
+    log.Printf("gRPC server listening on %v", lis.Addr())
+
+    return grpcServer.Serve(lis)
+}
+
+// --- HTTP Server Startup ---
+
+func runHTTPServer(s *networkServer) {
+    http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+        s.mu.RLock()
+        defer s.mu.RUnlock()
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(s.kvStore)
+    })
+
+    httpPort := ":" + fmt.Sprintf("%d", 8000+atoi(thisnode.port)) // offset http port
+    log.Printf("HTTP server listening on %v/status", httpPort)
+    log.Fatal(http.ListenAndServe(httpPort, nil))
+}
+
+// simple atoi helper
+func atoi(s string) int {
+    var n int
+    fmt.Sscanf(s, "%d", &n)
+    return n
+}
+
+// --- Main ---
+
+func main() {
+    thisnode.nodelist = make(map[string]string)
+
+    args := os.Args[1:]
+    if len(args) < 3 {
+        fmt.Println("Usage: go run main.go <id> <grpc_port> <leader_id>")
+        return
+    }
+
+    thisnode.id = args[0]
+    thisnode.port = args[1]
+    leaderID = args[2]
+
+    fmt.Printf("Node ID: %s\n", thisnode.id)
+    fmt.Printf("gRPC Port: %s\n", thisnode.port)
+    fmt.Printf("Leader ID: %s\n", leaderID)
+
+    // Add self to nodelist (address = :<port>)
+    thisnode.nodelist[thisnode.id] = ":" + thisnode.port
+
+    // Initialize gRPC server with empty kvStore
+    srv := &networkServer{
+        kvStore: make(map[string]string),
+    }
+
+    go func() {
+        if err := runGRPCServer(srv); err != nil {
+            log.Fatal(err)
+        }
+    }()
+
+    go runHTTPServer(srv)
+
+    // Block forever
+    select {}
+}
+
